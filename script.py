@@ -61,6 +61,9 @@ def consultar_tasa_dinamica(token):
     urls = [
         "https://api.invertironline.com/api/v2/Cotizaciones/Cauciones/PESOS",
         "https://api.invertironline.com/api/v2/Cotizaciones/Cauciones/PESOS/1",
+        "https://api.invertironline.com/api/v2/Cotizaciones/Cauciones/PESOS/2",
+        "https://api.invertironline.com/api/v2/Cotizaciones/Cauciones/PESOS/7",
+        "https://api.invertironline.com/api/v2/Cotizaciones/Cauciones/PESOS/14",
     ]
     headers = {
         'Authorization': f'Bearer {token}',
@@ -72,72 +75,154 @@ def consultar_tasa_dinamica(token):
         return {"ok": False, "motivo": "Sin token de autenticacion"}
 
     ultimo_error = None
+    hubo_5xx = False
+    hubo_auth = False
+    hubo_parseo = False
+    hubo_red = False
+    endpoints_5xx = []
+
+    max_reintentos_5xx = 3
+    backoff_base_seg = 1
+
     for url in urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=10)
-        except requests.RequestException as exc:
-            ultimo_error = {"ok": False, "motivo": f"Error de red consultando cauciones: {exc}"}
-            continue
+        for intento in range(max_reintentos_5xx):
+            try:
+                r = requests.get(url, headers=headers, timeout=10)
+            except requests.RequestException as exc:
+                hubo_red = True
+                ultimo_error = {
+                    "ok": False,
+                    "tipo": "red",
+                    "motivo": f"Error de red consultando cauciones: {exc}"
+                }
+                break
 
-        if r.status_code >= 500:
-            # IOL suele responder 500 con HTML fuera de horario o por saturacion.
-            ultimo_error = {
-                "ok": False,
-                "motivo": "IOL temporalmente no disponible (HTTP 5xx)",
-                "detalle": f"Endpoint: {url}"
-            }
-            continue
+            if r.status_code >= 500:
+                hubo_5xx = True
+                endpoints_5xx.append(url)
+                if intento < (max_reintentos_5xx - 1):
+                    espera = backoff_base_seg * (2 ** intento)
+                    time.sleep(espera)
+                    continue
 
-        if r.status_code != 200:
-            detalle = ""
-            content_type = r.headers.get('Content-Type', '').lower()
-            if 'application/json' in content_type:
-                try:
-                    detalle = str(r.json())[:300]
-                except ValueError:
+                ultimo_error = {
+                    "ok": False,
+                    "tipo": "servidor",
+                    "motivo": "IOL temporalmente no disponible (HTTP 5xx)",
+                    "detalle": f"Endpoint: {url}"
+                }
+                break
+
+            if r.status_code in (401, 403):
+                hubo_auth = True
+                detalle = ""
+                content_type = r.headers.get('Content-Type', '').lower()
+                if 'application/json' in content_type:
+                    try:
+                        detalle = str(r.json())[:300]
+                    except ValueError:
+                        detalle = r.text[:120]
+                else:
                     detalle = r.text[:120]
-            else:
-                detalle = f"Respuesta no JSON ({content_type or 'desconocido'})"
+
+                ultimo_error = {
+                    "ok": False,
+                    "tipo": "auth",
+                    "motivo": f"Error de autenticacion/permiso HTTP {r.status_code}",
+                    "detalle": detalle or "Token invalido/expirado o alcance insuficiente"
+                }
+                break
+
+            if r.status_code != 200:
+                detalle = ""
+                content_type = r.headers.get('Content-Type', '').lower()
+                if 'application/json' in content_type:
+                    try:
+                        detalle = str(r.json())[:300]
+                    except ValueError:
+                        detalle = r.text[:120]
+                else:
+                    detalle = f"Respuesta no JSON ({content_type or 'desconocido'})"
+
+                ultimo_error = {
+                    "ok": False,
+                    "tipo": "http",
+                    "motivo": f"Cauciones HTTP {r.status_code}",
+                    "detalle": detalle
+                }
+                break
+
+            try:
+                payload = r.json()
+            except ValueError:
+                hubo_parseo = True
+                ultimo_error = {
+                    "ok": False,
+                    "tipo": "parseo",
+                    "motivo": "Respuesta de cauciones no es JSON",
+                    "detalle": f"Endpoint: {url}"
+                }
+                break
+
+            panel = extraer_panel_cauciones(payload)
+            mejor_tasa = 0
+            mejor_plazo = "N/A"
+
+            for c in panel:
+                puntas = c.get('puntas') or []
+                if not puntas:
+                    continue
+
+                for punta in puntas:
+                    tasa_actual = punta.get('tasa', 0)
+                    if tasa_actual > mejor_tasa:
+                        mejor_tasa = tasa_actual
+                        mejor_plazo = c.get('plazo', 'N/A')
+
+            if mejor_tasa > 0:
+                return {"ok": True, "tasa": mejor_tasa, "plazo": mejor_plazo}
 
             ultimo_error = {
                 "ok": False,
-                "motivo": f"Cauciones HTTP {r.status_code}",
-                "detalle": detalle
+                "tipo": "sin_puntas",
+                "motivo": "Sin puntas con tasa",
+                "detalle": f"Endpoint consultado: {url}. Mercado posiblemente cerrado o sin liquidez"
             }
             continue
 
-        try:
-            payload = r.json()
-        except ValueError:
-            ultimo_error = {"ok": False, "motivo": "Respuesta de cauciones no es JSON"}
-            continue
-
-        panel = extraer_panel_cauciones(payload)
-        mejor_tasa = 0
-        mejor_plazo = "N/A"
-
-        for c in panel:
-            puntas = c.get('puntas') or []
-            if not puntas:
-                continue
-
-            for punta in puntas:
-                tasa_actual = punta.get('tasa', 0)
-                if tasa_actual > mejor_tasa:
-                    mejor_tasa = tasa_actual
-                    mejor_plazo = c.get('plazo', 'N/A')
-
-        if mejor_tasa > 0:
-            return {"ok": True, "tasa": mejor_tasa, "plazo": mejor_plazo}
-
-        ultimo_error = {
+    if hubo_auth:
+        return ultimo_error or {
             "ok": False,
-            "motivo": "Sin puntas con tasa",
-            "detalle": "Mercado posiblemente cerrado o sin liquidez"
+            "tipo": "auth",
+            "motivo": "Fallo de autenticacion con API de IOL"
+        }
+
+    if hubo_5xx:
+        detalle_endpoints = ", ".join(sorted(set(endpoints_5xx))) if endpoints_5xx else "desconocido"
+        return ultimo_error or {
+            "ok": False,
+            "tipo": "servidor",
+            "motivo": "IOL temporalmente no disponible (HTTP 5xx)",
+            "detalle": f"Endpoints con 5xx: {detalle_endpoints}"
+        }
+
+    if hubo_parseo:
+        return ultimo_error or {
+            "ok": False,
+            "tipo": "parseo",
+            "motivo": "Respuesta invalida de API de cauciones"
+        }
+
+    if hubo_red:
+        return ultimo_error or {
+            "ok": False,
+            "tipo": "red",
+            "motivo": "Error de red al consultar cauciones"
         }
 
     return ultimo_error or {
         "ok": False,
+        "tipo": "desconocido",
         "motivo": "No se pudo obtener tasa de cauciones",
         "detalle": "Sin respuesta util de IOL"
     }
@@ -167,11 +252,12 @@ def obtener_mejor_tasa():
         }
         return tasa, plazo, None
 
+    tipo_error = resultado.get("tipo", "desconocido")
     motivo = resultado.get("motivo", "Error desconocido")
     detalle = resultado.get("detalle")
     if detalle:
-        return None, None, f"{motivo}. {detalle}"
-    return None, None, motivo
+        return None, None, f"[{tipo_error}] {motivo}. {detalle}"
+    return None, None, f"[{tipo_error}] {motivo}"
 
 def revisar_comandos():
     global last_update_id
@@ -202,7 +288,7 @@ def revisar_comandos():
                     
             elif mensaje_recibido in ('/status', 'status'):
                 ahora = datetime.now(ARG_TZ)
-                en_horario = ahora.weekday() <= 4 and 11 <= ahora.hour < 17
+                en_horario = ahora.weekday() <= 4 and ((ahora.hour > 10 or (ahora.hour == 10 and ahora.minute >= 30)) and ahora.hour < 17)
                 enviar_telegram(
                     f"🤖 Bot *Online* | Hora AR: {ahora.strftime('%Y-%m-%d %H:%M:%S')} | "
                     f"Horario de mercado: {'SI' if en_horario else 'NO'}"
@@ -218,7 +304,9 @@ while True:
     # Siempre revisamos si hay comandos (aunque sea de noche)
     revisar_comandos()
 
-    if ahora.weekday() <= 4 and 11 <= ahora.hour < 17:
+    en_horario_mercado = ahora.weekday() <= 4 and ((ahora.hour > 10 or (ahora.hour == 10 and ahora.minute >= 30)) and ahora.hour < 17)
+
+    if en_horario_mercado:
         tasa, plazo, error = obtener_mejor_tasa()
         if tasa:
             for nivel in reversed(INTERES_TASAS):
